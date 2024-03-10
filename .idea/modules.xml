@@ -3,6 +3,7 @@
   <component name="ProjectModuleManager">
     <modules>
       <module fileurl="file://$PROJECT_DIR$/.idea/GeeRPC.iml" filepath="$PROJECT_DIR$/.idea/GeeRPC.iml" />
+      <module fileurl="file://$PROJECT_DIR$/../GeeRPC-client/.idea/GeeRPC-client.iml" filepath="$PROJECT_DIR$/../GeeRPC-client/.idea/GeeRPC-client.iml" />
     </modules>
   </component>
 </project>

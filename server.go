@@ -1,13 +1,15 @@
-package GeeRPC
+package main
 
 import (
 	"encoding/json"
-	"fmt"
+	"errors"
 	"github.com/lwyOAO/GeeRPC/codec"
+	"github.com/lwyOAO/GeeRPC/service"
 	"io"
 	"log"
 	"net"
 	"reflect"
+	"strings"
 	"sync"
 )
 
@@ -29,7 +31,9 @@ var DefaultOption = &Option{
 }
 
 // Server represents an RPC Server.
-type Server struct{}
+type Server struct {
+	serviceMap sync.Map // 并发安全的map
+}
 
 func NewServer() *Server {
 	return &Server{}
@@ -59,27 +63,23 @@ func (server *Server) ServeConn(conn io.ReadWriteCloser) {
 	defer func() {
 		_ = conn.Close()
 	}()
-
 	// 解码option
 	var opt Option
 	if err := json.NewDecoder(conn).Decode(&opt); err != nil {
 		log.Println("rpc server: options error:", err)
 		return
 	}
-
 	// 校验请求编号是否正确
 	if opt.MagicNumber != MagicNumber {
 		log.Printf("rpc server: invalid magic number %x", opt.MagicNumber)
 		return
 	}
-
 	// 根据编解码器类型选择编解码器
 	f := codec.NewCodecFuncMap[opt.CodecType]
 	if f == nil {
 		log.Printf("rpc server: invalid codec type %s", opt.CodecType)
 		return
 	}
-
 	// 将conn放入编解码器实例，继续处理
 	server.serveCodec(f(conn))
 }
@@ -126,6 +126,8 @@ func (server *Server) readRequestHeader(cc codec.Codec) (*codec.Header, error) {
 type request struct {
 	h            *codec.Header
 	argv, replyv reflect.Value // argv、replyv of request
+	mtype        *service.MethodType
+	svc          *service.Service
 }
 
 func (server *Server) readRequest(cc codec.Codec) (*request, error) {
@@ -135,9 +137,16 @@ func (server *Server) readRequest(cc codec.Codec) (*request, error) {
 	}
 
 	req := &request{h: h}
-	// TODO now we don't know the type of request argv, now just suppose it's string
-	req.argv = reflect.New(reflect.TypeOf(""))
-	if err = cc.ReadBody(req.argv.Interface()); err != nil {
+	req.svc, req.mtype, err = server.findService(h.ServiceMethod)
+	if err != nil {
+		return req, err
+	}
+	req.argv = req.mtype.NewArgv()
+	req.replyv = req.mtype.NewReplyv()
+
+	// 确保argvi是一个指针
+	argvi := req.argv.Interface()
+	if err = cc.ReadBody(argvi); err != nil {
 		log.Println("rpc server: read argv err:", err)
 	}
 	return req, nil
@@ -153,10 +162,42 @@ func (server *Server) sendResponse(cc codec.Codec, h *codec.Header, body any, se
 }
 
 func (server *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup) {
-	// TODO should call registered rpc methods to get the right replyv
-
 	defer wg.Done()
-	log.Println(req.h, req.argv.Elem())
-	req.replyv = reflect.ValueOf(fmt.Sprintf("geerpc resp %d", req.h.Seq))
+	err := req.svc.Call(req.mtype, req.argv, req.replyv)
+	if err != nil {
+		req.h.Error = err.Error()
+		server.sendResponse(cc, req.h, invalidRequest, sending)
+		return
+	}
 	server.sendResponse(cc, req.h, req.replyv.Interface(), sending)
+}
+
+func (server *Server) Register(rcvr any) error {
+	s := service.NewService(rcvr)
+	if _, dup := server.serviceMap.LoadOrStore(s.Name, s); dup {
+		return errors.New("rpc: service already defined: " + s.Name)
+	}
+	return nil
+}
+
+func Register(rcvr any) error { return DefaultServer.Register(rcvr) }
+
+func (server *Server) findService(serviceMethod string) (svc *service.Service, mtype *service.MethodType, err error) {
+	dot := strings.LastIndex(serviceMethod, ".")
+	if dot < 0 {
+		err = errors.New("rpc server: service/method request ill-format: " + serviceMethod)
+		return
+	}
+	serviceName, methodName := serviceMethod[:dot], serviceMethod[dot+1:]
+	svci, ok := server.serviceMap.Load(serviceName)
+	if !ok {
+		err = errors.New("rpc server: can't find service " + serviceName)
+		return
+	}
+	svc = svci.(*service.Service)
+	mtype = svc.Method[methodName]
+	if mtype == nil {
+		err = errors.New("rpc server: can't find method " + methodName)
+	}
+	return
 }
